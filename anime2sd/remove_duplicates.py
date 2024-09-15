@@ -3,6 +3,11 @@ import logging
 from tqdm import tqdm
 from typing import List, Tuple, Set, Optional
 from PIL import Image
+from pathlib import Path
+import subprocess
+import time
+
+
 
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -232,9 +237,13 @@ class DuplicateRemover(object):
         Args:
             dataset: Dataset containing images.
         """
+        start_time = time.time()
         self.logger.info(f"Compute embeddings for {len(dataset)} images ...")
         embeddings = self.compute_embeddings(dataset)
+        embedding_time = time.time() - start_time
+        self.logger.info(f"Embedding computation took: {embedding_time:.2f} seconds")
 
+        start_time = time.time()
         samples_to_remove = set()
 
         for k in range(0, len(embeddings), self.max_compare_size):
@@ -243,15 +252,22 @@ class DuplicateRemover(object):
                 embeddings, indices=np.arange(k, end)
             )
             samples_to_remove = samples_to_remove | samples_to_remove_sub
+        duplicate_time = time.time() - start_time
+        self.logger.info(f"Duplicate identification took: {duplicate_time:.2f} seconds")
 
-        self.logger.info("Removing similar images ...")
-        for sample_id in tqdm(samples_to_remove):
-            img_path, _ = dataset[sample_id]
-            os.remove(img_path)
-            related_paths = get_related_paths(img_path)
-            for related_path in related_paths:
-                if os.path.exists(related_path):
-                    os.remove(related_path)
+        start_time = time.time()
+        start_time = time.time()
+        files_to_remove = [dataset.image_paths[sample_id] for sample_id in samples_to_remove] # image_paths
+        file_list_time = time.time() - start_time
+        self.logger.info(f"File list preparation took: {file_list_time:.2f} seconds")
+
+        if files_to_remove:
+            start_time = time.time()
+            command = ["rm"] + files_to_remove  # rm for linusx 
+            # command = ["del"] + files_to_remove  # del for win(lol)
+            subprocess.run(command, check=True)
+            removal_time = time.time() - start_time
+            self.logger.info(f"File removal took: {removal_time:.2f} seconds")
 
     def remove_similar_from_dir(self, dirpath: str, portion: Optional[str] = None):
         """
