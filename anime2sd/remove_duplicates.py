@@ -19,6 +19,8 @@ from torch.utils.data import DataLoader
 
 from .basics import get_related_paths, get_images_recursively
 
+def get_file_size(file_path):
+    return os.path.getsize(file_path)
 
 class ImageDataset(Dataset):
     """
@@ -65,6 +67,9 @@ class ImageDataset(Dataset):
         return cls(image_paths, transform)
 
     @classmethod
+    def get_file_size(file_path):
+        return os.path.getsize(file_path)
+    
     def from_subdirectories(
         cls, dataset_dir: str, transform: callable, portion: Optional[str] = "first"
     ):
@@ -130,9 +135,9 @@ class DuplicateRemover(object):
         model_name: str,
         device: Optional[str] = None,
         threshold: float = 0.96,
-        max_compare_size: int = 10000,
-        dataloader_batch_size: int = 16,
-        dataloader_num_workers: int = 4,
+        max_compare_size: int = 100000,
+        dataloader_batch_size: int = 20,
+        dataloader_num_workers: int = 16,
         pin_memory: bool = True,
         logger: Optional[logging.Logger] = None,
     ):
@@ -168,31 +173,51 @@ class DuplicateRemover(object):
         self.pin_memory = pin_memory
         self.data_cfg = timm.data.resolve_data_config(self.model.pretrained_cfg)
         self.transform = timm.data.create_transform(**self.data_cfg)
-
+        
     def compute_embeddings(self, dataset: ImageDataset):
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.dataloader_batch_size,
-            num_workers=self.dataloader_num_workers,
-            pin_memory=self.pin_memory,
-            shuffle=False,
+        num_gpus = torch.cuda.device_count()
+        if num_gpus == 0:
+            self.logger.warning("No GPU found. Falling back to CPU.")
+            num_gpus = 1
+            device = torch.device("cpu")
+        else:
+            device = torch.device("cuda")
+
+        # Split the dataset into num_gpus parts
+        subset_size = len(dataset) // num_gpus
+        dataset_subsets = [
+            torch.utils.data.Subset(dataset, range(i * subset_size, (i + 1) * subset_size))
+            for i in range(num_gpus)
+        ]
+        # Add remaining data to the last subset
+        dataset_subsets[-1] = torch.utils.data.Subset(
+            dataset, range((num_gpus - 1) * subset_size, len(dataset))
         )
-        """
-        Compute embeddings for all images in the dataset.
 
-        Args:
-            dataset: Dataset containing images.
+        # Create a separate DataLoader for each subset
+        dataloaders = [
+            DataLoader(
+                subset,
+                batch_size=self.dataloader_batch_size,
+                num_workers=self.dataloader_num_workers,
+                pin_memory=self.pin_memory,
+                shuffle=False,
+            )
+            for subset in dataset_subsets
+        ]
 
-        Returns:
-            np.ndarray: Array of embeddings of shape n_images x n_featuers.
-        """
         embeddings = []
 
-        with torch.no_grad(), torch.autocast(device_type=self.device):
-            for _, images in tqdm(dataloader):
-                images = images.to(self.device)
-                features = self.model(images)
-                embeddings.append(features.cpu().float().numpy())
+        # Compute embeddings on each GPU
+        for i, dataloader in enumerate(dataloaders):
+            # Move the model to the current GPU
+            model = self.model.to(device)
+            
+            with torch.no_grad(), torch.autocast(device_type=device.type):
+                for _, images in tqdm(dataloader, desc=f"GPU {i}"):
+                    images = images.to(device)
+                    features = model(images)
+                    embeddings.append(features.cpu().float().numpy())
 
         return np.vstack(embeddings)
 
@@ -217,17 +242,21 @@ class DuplicateRemover(object):
 
         samples_to_remove = set()
         samples_to_keep = set()
+        
+        file_sizes = {idx: get_file_size(self.dataset.image_paths[idx]) for idx in indices}
 
         for idx in tqdm(range(len(embeddings))):
             sample_id = indices[idx]
-            if sample_id not in samples_to_remove:
-                # Keep the first instance of two duplicates
-                samples_to_keep.add(sample_id)
-
+            if sample_id not in samples_to_remove and sample_id not in samples_to_keep:
                 dup_idxs = np.where(similarity_matrix[idx] > self.threshold)[0]
-                for dup in dup_idxs:
-                    # We kept the first instance so remove all other duplicates
-                    samples_to_remove.add(indices[dup])
+                if len(dup_idxs) > 0:
+                    similar_images = [sample_id] + [indices[dup] for dup in dup_idxs]
+                    largest_image = max(similar_images, key=lambda x: file_sizes[x])
+                    samples_to_keep.add(largest_image)
+                    samples_to_remove.update(set(similar_images) - {largest_image})
+                else:
+                    samples_to_keep.add(sample_id)
+
         return samples_to_remove, samples_to_keep
 
     def remove_similar(self, dataset: ImageDataset):
@@ -257,14 +286,14 @@ class DuplicateRemover(object):
 
         start_time = time.time()
         start_time = time.time()
-        files_to_remove = [dataset.image_paths[sample_id] for sample_id in samples_to_remove] # image_paths
+        files_to_remove = [dataset.image_paths[sample_id] for sample_id in samples_to_remove] # Используем image_paths
         file_list_time = time.time() - start_time
         self.logger.info(f"File list preparation took: {file_list_time:.2f} seconds")
 
         if files_to_remove:
             start_time = time.time()
-            command = ["rm"] + files_to_remove  # rm for linusx 
-            # command = ["del"] + files_to_remove  # del for win(lol)
+            command = ["rm"] + files_to_remove  # Используем rm для Linux
+            # command = ["del"] + files_to_remove  # Используем del для Windows
             subprocess.run(command, check=True)
             removal_time = time.time() - start_time
             self.logger.info(f"File removal took: {removal_time:.2f} seconds")
@@ -294,4 +323,5 @@ class DuplicateRemover(object):
             dataset = ImageDataset.from_directory(dirpath, self.transform)
         if len(dataset) == 0:
             return
+        self.dataset = dataset
         self.remove_similar(dataset)
