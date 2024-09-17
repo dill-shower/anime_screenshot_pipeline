@@ -1,4 +1,4 @@
-# Anime2SD
+# Anime2SD (WIP)
 
 **A 99% automatized pipeline to construct training set from anime and more for text-to-image model training**
 
@@ -80,7 +80,7 @@ The script performs all the following automatically.
 
 1. Clone this directory
     ```bash
-    git clone https://github.com/cyber-meow/anime_screenshot_pipeline
+    git clone https://github.com/dill-shower/anime_screenshot_pipeline
     cd anime_screenshot_pipeline
     ```
 
