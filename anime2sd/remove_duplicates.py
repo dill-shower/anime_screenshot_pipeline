@@ -316,7 +316,7 @@ class DuplicateRemover(object):
             rtype = "op" if portion == "first" else "ed"
             self.logger.info(f"Removing {rtype} duplicates for '{dirpath}' ...")
             dataset = ImageDataset.from_subdirectories(
-                dirpath, self.transform, portion=portion
+                dirpath, transform=self.transform, portion=portion
             )
         else:
             self.logger.info(f"Removing duplicates for '{dirpath}' ...")
