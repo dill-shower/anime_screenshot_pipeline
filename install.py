@@ -44,7 +44,7 @@ def prepare_environment():
         "torch",
         (
             f"{sys.executable} -m pip install torch torchvision torchaudio "
-            "--index-url https://download.pytorch.org/whl/cu118"
+            "--index-url https://download.pytorch.org/whl/cu121"
         ),
     )
 
