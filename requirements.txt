@@ -14,3 +14,4 @@ wheel==0.42.0           # For waifuc installation
 tqdm
 blake3
 xformers
+onnxruntime-gpu
