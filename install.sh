@@ -22,7 +22,7 @@ fi
 
 # Check if the script is being run as root
 if [[ $(id -u) -eq 0 ]]; then
-    printf "\e[1m\e[31mERROR: This script should not be run as root.\e[0m\" 
+    printf "\e[1m\e[31mERROR: This script should not be run as root.\e[0m\n" 
 fi
 
 
