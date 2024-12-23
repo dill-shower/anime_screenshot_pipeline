@@ -1,4 +1,4 @@
-dghs_imgutils==0.2.10
+dghs_imgutils==0.8.0
 natsort==8.4.0
 numpy==1.26.2
 Pillow==10.1.0
