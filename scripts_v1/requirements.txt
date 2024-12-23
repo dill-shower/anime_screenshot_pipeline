@@ -1,6 +1,6 @@
 anime_face_detector==0.0.9
 efficientnet_pytorch==0.7.1
-einops==0.6.0
+einops==0.8.0
 fairscale==0.4.13
 huggingface_hub==0.0.12
 matplotlib==3.6.2
