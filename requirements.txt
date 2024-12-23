@@ -10,7 +10,6 @@ hbutils==0.9.3
 pynyaasi==0.0.1
 torrentp==0.1.6
 aesthetic-predictor-v2-5
-transformers==4.35.0    # Only used for embedding name checking
 wheel==0.42.0           # For waifuc installation
 tqdm
 blake3
