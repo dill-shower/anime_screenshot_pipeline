@@ -10,7 +10,7 @@ hbutils==0.9.3
 pynyaasi==0.0.1
 torrentp==0.1.6
 aesthetic-predictor-v2-5
-wheel==0.42.0           # For waifuc installation
+wheel==0.45.1           # For waifuc installation
 tqdm
 blake3
 xformers
