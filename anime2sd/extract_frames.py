@@ -252,7 +252,7 @@ def extract_and_remove_similar(
             env['LD_PRELOAD'] = mimalloc_path
     
     # Supported video file extensions
-    video_extensions = [".mp4", ".mkv", ".avi", ".flv", ".mov", ".wmv"]
+    video_extensions = [".mp4", ".mkv", ".avi", ".flv", ".mov", ".wmv", ".ts", ".m2ts"]
 
     # Recursively find all video files in the specified
     # source directory and its subdirectories
