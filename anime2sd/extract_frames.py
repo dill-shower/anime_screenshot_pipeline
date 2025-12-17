@@ -171,8 +171,8 @@ def get_ffmpeg_command(file, file_pattern, extract_key, num_threads, logger=None
     if logger is None:
         logger = logging.getLogger()
 
-    # -nostdin: prevents ffmpeg from entering interactive mode and hanging on stdin
-    # -y: overwrite output files if any exist
+    # -nostdin: prevents interactive mode ("Enter command:")
+    # -y: overwrite existing outputs
     command = ["ffmpeg", "-nostdin", "-y"]
 
     # Threads for decoding
@@ -195,7 +195,7 @@ def get_ffmpeg_command(file, file_pattern, extract_key, num_threads, logger=None
             ]
         )
 
-    # BMP is lossless/uncompressed; no quality/codec args needed
+    # BMP is lossless/uncompressed; no quality params needed
     command.append(file_pattern)
 
     return command
@@ -212,7 +212,11 @@ def extract_and_remove_similar(
 ) -> None:
     """
     Extracts frames from video files in the specified source directory,
-    saves them to the destination directory, and optionally removes similar frames.
+    saves them to the destination directory, and optionally removes similar frames
+    inside each episode directory.
+
+    NOTE: OP/ED cross-episode duplicate pass has been removed here on purpose,
+    because you run a global deduper later (run.py) over the whole result directory.
     """
     if logger is None:
         logger = logging.getLogger()
@@ -226,7 +230,6 @@ def extract_and_remove_similar(
     env = os.environ.copy()
     if mimalloc_path:
         logger.info(f"Using mimalloc for memory allocation: {mimalloc_path}")
-        # Prepend to existing LD_PRELOAD if any
         existing_preload = env.get("LD_PRELOAD", "")
         if existing_preload:
             env["LD_PRELOAD"] = f"{mimalloc_path}:{existing_preload}"
@@ -236,7 +239,7 @@ def extract_and_remove_similar(
     # Supported video file extensions
     video_extensions = [".mp4", ".mkv", ".avi", ".flv", ".mov", ".wmv", ".m2ts"]
 
-    # Recursively find all video files in the specified source directory and its subdirectories
+    # Recursively find all video files
     files = [
         os.path.join(root, file)
         for root, dirs, files in os.walk(src_dir)
@@ -248,6 +251,7 @@ def extract_and_remove_similar(
     for i, file in enumerate(sorted(files)):
         filename_without_ext = os.path.splitext(os.path.basename(file))[0]
 
+        # Extract the anime name and episode number
         anime_name, ep_num = parse_anime_info(filename_without_ext)
         anime_name = "_".join(re.split(r"\s+", anime_name))
         prefix_anime = f"{prefix if isinstance(prefix, str) else anime_name}_"
@@ -261,14 +265,12 @@ def extract_and_remove_similar(
         dst_ep_dir = os.path.join(dst_dir, filename_without_ext)
         os.makedirs(dst_ep_dir, exist_ok=True)
 
+        # BMP output
         file_pattern = os.path.join(dst_ep_dir, f"{prefix_anime}EP{ep_num}_%d.bmp")
 
-        ffmpeg_command = get_ffmpeg_command(
-            file, file_pattern, extract_key, num_threads, logger
-        )
+        ffmpeg_command = get_ffmpeg_command(file, file_pattern, extract_key, num_threads, logger)
         logger.info(ffmpeg_command)
 
-        # stdin=DEVNULL: extra safety against interactive "Enter command:" mode
         subprocess.run(
             ffmpeg_command,
             check=True,
@@ -276,10 +278,11 @@ def extract_and_remove_similar(
             stdin=subprocess.DEVNULL,
         )
 
+        # Per-episode dedup (kept)
         if duplicate_remover is not None:
             duplicate_remover.remove_similar_from_dir(dst_ep_dir)
 
-    # Go through all files again to remove duplicates from op and ed
-    if duplicate_remover is not None:
-        duplicate_remover.remove_similar_from_dir(dst_dir, portion="first")
-        duplicate_remover.remove_similar_from_dir(dst_dir, portion="last")
+    # Removed: OP/ED pass across dst_dir (redundant if you run global run.py later)
+    # if duplicate_remover is not None:
+    #     duplicate_remover.remove_similar_from_dir(dst_dir, portion="first")
+    #     duplicate_remover.remove_similar_from_dir(dst_dir, portion="last")
