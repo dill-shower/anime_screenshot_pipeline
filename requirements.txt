@@ -1,18 +1,39 @@
+# --- Core utils ---
 dghs_imgutils>=0.2.10
-natsort>=8.4.0
-numpy>=1.26.2
-Pillow>=10.1.0
-tqdm>=4.64.0
-toml>=0.10.2
-scikit_learn>=1.3.2
-timm>=0.9.12
 hbutils>=0.9.3
+natsort>=8.4.0
+toml>=0.10.2
+tqdm>=4.64.0
+blake3>=0.4.1
+
+# --- Numerics / Images ---
+# (Если хочешь максимум совместимости со sklearn/timm, держись numpy < 2.0)
+numpy>=1.26.2,<2.0
+Pillow>=10.1.0
+
+# --- ML / Embeddings ---
+timm>=0.9.12
+safetensors>=0.4.0
+
+# PyTorch (версии лучше фиксировать под твою CUDA и xformers)
+# Укажи свои (пример ниже комментариями). Без фиксации pip может поставить несовместимые.
+# torch==2.5.1
+# torchvision==0.20.1
+xformers
+
+# --- Similarity search acceleration (нужно для быстрого поиска дубликатов) ---
+# Ставь ОДНО: faiss-cpu ИЛИ faiss-gpu (faiss-gpu сложнее по совместимости CUDA).
+faiss-cpu>=1.7.4; platform_system=="Linux"
+# faiss-gpu>=1.7.4; platform_system=="Linux"
+
+# --- Other pipeline deps ---
 pynyaasi>=0.0.1
 torrentp>=0.1.6
 aesthetic-predictor-v2-5
-wheel>=0.42.0           # For waifuc installation
-tqdm
-blake3
-xformers
 onnxruntime-gpu
 
+# For waifuc installation (как у тебя было)
+wheel>=0.42.0
+
+# --- Optional / keep only if реально используешь где-то в pipeline ---
+scikit-learn>=1.3.2
