@@ -156,6 +156,7 @@ def get_images_recursively(folder_path):
         "*.[Jj][Pp][Ee][Gg]",
         "*.[Ww][Ee][Bb][Pp]",
         "*.[Gg][Ii][Ff]",
+        "*.[Bb][Mm][Pp]",
     ]
 
     image_path_list = [
