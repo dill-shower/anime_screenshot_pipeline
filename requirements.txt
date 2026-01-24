@@ -1,5 +1,6 @@
 # --- Core utils ---
 dghs_imgutils>=0.2.10
+pillow-jxl-plugin
 hbutils>=0.9.3
 natsort>=8.4.0
 toml>=0.10.2
