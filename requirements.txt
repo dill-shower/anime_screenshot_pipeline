@@ -5,7 +5,7 @@ natsort>=8.4.0
 toml>=0.10.2
 tqdm>=4.64.0
 blake3>=0.4.1
-
+pilmoji==2.0.4
 # --- Numerics / Images ---
 # (Если хочешь максимум совместимости со sklearn/timm, держись numpy < 2.0)
 #numpy>=1.26.2,<2.0
