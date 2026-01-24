@@ -200,15 +200,15 @@ def calculate_split_points(video_path: str, num_parts: int, logger: logging.Logg
 
 
 def process_video_part(args):
-    """Process one video part - extract frames to JPEG XL."""
+    """Process one video part - extract frames to PNG."""
     (input_file, part_id, start_time, duration, output_dir, 
      prefix_anime, anime_name, ep_num, extract_key, threads, 
-     allocator_lib, jxl_effort) = args
+     allocator_lib, png_compression) = args
     
     part_dir = os.path.join(output_dir, f'_temp_part_{part_id:04d}')
     os.makedirs(part_dir, exist_ok=True)
     
-    output_pattern = os.path.join(part_dir, f"frame_%08d.jxl")
+    output_pattern = os.path.join(part_dir, f"frame_%08d.png")
     
     command = [
         "ffmpeg",
@@ -231,12 +231,10 @@ def process_video_part(args):
             "mpdecimate=hi=64*200:lo=64*50:frac=0.33,setpts=N/FRAME_RATE/TB"
         ])
 
-    # JPEG XL lossless with minimal effort for maximum speed
+    # PNG with compression level (0-9, where 1 = fast)
     command.extend([
-        "-c:v", "libjxl",
-        "-modular", "1",
-        "-distance", "0",           # 0 = lossless
-        "-effort", str(jxl_effort), # 1 = fastest, 9 = slowest/best
+        "-c:v", "png",
+        "-compression_level", str(png_compression),
         "-loglevel", "error",
         output_pattern
     ])
@@ -269,7 +267,7 @@ def process_video_part(args):
             error_msg = ''.join(stderr_output[-10:])
             raise subprocess.CalledProcessError(process.returncode, command, error_msg)
         
-        frames = list(Path(part_dir).glob("frame_*.jxl"))
+        frames = list(Path(part_dir).glob("frame_*.png"))
         if not frames:
             raise Exception(f"No frames extracted for part {part_id}")
         
@@ -312,10 +310,10 @@ def merge_frames_fast(results: List[dict], output_dir: str, prefix_anime: str,
     
     for idx, result in enumerate(successful_results):
         part_dir = result['part_dir']
-        frames = sorted(Path(part_dir).glob("frame_*.jxl"))
+        frames = sorted(Path(part_dir).glob("frame_*.png"))
         
         for frame_path in frames:
-            new_name = f"{prefix_anime}_{anime_name}_EP{ep_num}_{global_frame_counter:08d}.jxl"
+            new_name = f"{prefix_anime}_{anime_name}_EP{ep_num}_{global_frame_counter:08d}.png"
             new_path = os.path.join(final_dir, new_name)
             os.rename(str(frame_path), new_path)
             global_frame_counter += 1
@@ -340,7 +338,7 @@ def process_single_video(
     extract_key: bool,
     duplicate_remover: Optional[DuplicateRemover],
     logger: logging.Logger,
-    jxl_effort: int,
+    png_compression: int,
     allocator_lib: Optional[str],
     base_config: dict,
 ) -> None:
@@ -380,12 +378,12 @@ def process_single_video(
             extract_key,
             config['threads_per_part'],
             allocator_lib,
-            jxl_effort,
+            png_compression,
         ))
     
     start_time_total = time.time()
     
-    logger.info(f"\nStarting frame extraction (JPEG XL lossless)...\n")
+    logger.info(f"\nStarting frame extraction (PNG lossless, compression={png_compression})...\n")
     
     results = []
     completed = 0
@@ -450,7 +448,7 @@ def process_single_video(
     except Exception:
         shutil.rmtree(temp_base_dir, ignore_errors=True)
     
-    actual_size_bytes = sum(f.stat().st_size for f in Path(final_dir).glob("*.jxl"))
+    actual_size_bytes = sum(f.stat().st_size for f in Path(final_dir).glob("*.png"))
     actual_size_gb = actual_size_bytes / (1024**3)
     
     if duplicate_remover is not None:
@@ -460,7 +458,7 @@ def process_single_video(
             duplicate_remover.remove_similar_from_dir(final_dir)
             dup_time = time.time() - dup_start
             
-            final_size_bytes = sum(f.stat().st_size for f in Path(final_dir).glob("*.jxl"))
+            final_size_bytes = sum(f.stat().st_size for f in Path(final_dir).glob("*.png"))
             final_size_gb = final_size_bytes / (1024**3)
             removed_gb = actual_size_gb - final_size_gb
             
@@ -473,12 +471,12 @@ def process_single_video(
         final_size_gb = actual_size_gb
     
     total_time = time.time() - start_time_total
-    final_frame_count = len(list(Path(final_dir).glob("*.jxl")))
+    final_frame_count = len(list(Path(final_dir).glob("*.png")))
     
     logger.info(f"{'='*70}")
     logger.info(f"EXTRACTION COMPLETED")
     logger.info(f"   Total time: {total_time:.2f}s ({total_time/60:.2f} min)")
-    logger.info(f"   Format: JPEG XL lossless (effort={jxl_effort})")
+    logger.info(f"   Format: PNG lossless (compression={png_compression})")
     logger.info(f"   Output size: {final_size_gb:.2f} GB ({final_frame_count:,} frames)")
     if final_frame_count > 0:
         avg_size_kb = (actual_size_bytes / 1024) / final_frame_count
@@ -495,10 +493,10 @@ def extract_and_remove_similar(
     extract_key: bool = False,
     duplicate_remover: Optional[DuplicateRemover] = None,
     logger: Optional[logging.Logger] = None,
-    jxl_effort: int = 1,
+    png_compression: int = 1,
 ) -> None:
     """
-    Extract frames from video in JPEG XL format (lossless).
+    Extract frames from video in PNG format (lossless).
     
     Supports both a directory with video files and a single file.
     
@@ -510,7 +508,7 @@ def extract_and_remove_similar(
         extract_key: extract only key frames
         duplicate_remover: duplicate remover instance
         logger: logger instance
-        jxl_effort: 1-9 (1 = fastest, 9 = best compression)
+        png_compression: 0-9 (0 = no compression/fastest, 9 = max compression/slowest)
     """
     if logger is None:
         logger = logging.getLogger()
@@ -563,9 +561,10 @@ def extract_and_remove_similar(
         logger.info(f"   Threads per part: {base_config['threads_per_part']}")
         logger.info(f"{'='*70}\n")
         
-        logger.info(f"Output format: JPEG XL lossless (effort={jxl_effort})")
-        logger.info(f"   effort 1 = fastest encoding")
-        logger.info(f"   effort 9 = best compression (slower)\n")
+        logger.info(f"Output format: PNG lossless (compression={png_compression})")
+        logger.info(f"   compression 0 = no compression (fastest)")
+        logger.info(f"   compression 1 = fast compression")
+        logger.info(f"   compression 9 = best compression (slowest)\n")
         
         # Process each file
         for i, video_file in enumerate(video_files):
@@ -589,7 +588,7 @@ def extract_and_remove_similar(
                     extract_key=extract_key,
                     duplicate_remover=duplicate_remover,
                     logger=logger,
-                    jxl_effort=jxl_effort,
+                    png_compression=png_compression,
                     allocator_lib=allocator_lib,
                     base_config=base_config,
                 )
@@ -637,9 +636,10 @@ def extract_and_remove_similar(
     logger.info(f"   Threads per part: {base_config['threads_per_part']}")
     logger.info(f"{'='*70}\n")
     
-    logger.info(f"Output format: JPEG XL lossless (effort={jxl_effort})")
-    logger.info(f"   effort 1 = fastest encoding")
-    logger.info(f"   effort 9 = best compression (slower)\n")
+    logger.info(f"Output format: PNG lossless (compression={png_compression})")
+    logger.info(f"   compression 0 = no compression (fastest)")
+    logger.info(f"   compression 1 = fast compression")
+    logger.info(f"   compression 9 = best compression (slowest)\n")
 
     video_file = src_path
     filename_without_ext = Path(video_file).stem
@@ -657,7 +657,7 @@ def extract_and_remove_similar(
             extract_key=extract_key,
             duplicate_remover=duplicate_remover,
             logger=logger,
-            jxl_effort=jxl_effort,
+            png_compression=png_compression,
             allocator_lib=allocator_lib,
             base_config=base_config,
         )
@@ -680,6 +680,6 @@ if __name__ == "__main__":
         prefix="anime",
         ep_init=1,
         extract_key=False,
-        jxl_effort=1,
+        png_compression=1,
         logger=logger
     )
