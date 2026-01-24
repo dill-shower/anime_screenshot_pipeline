@@ -39,3 +39,5 @@ wheel>=0.42.0
 
 # --- Optional / keep only if реально используешь где-то в pipeline ---
 scikit-learn>=1.3.2
+matplotlib
+omegaconf
