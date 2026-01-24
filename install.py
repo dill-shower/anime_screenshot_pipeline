@@ -26,7 +26,7 @@ def install_package(package, command):
 def is_installed(package):
     try:
         subprocess.run(
-            f"{sys.executable} -m pip show {package}",
+            f"uv pip show {package} --python {sys.executable}",
             shell=True,
             capture_output=True,
             check=True,
@@ -36,15 +36,38 @@ def is_installed(package):
         return False
 
 
+def ensure_uv_installed():
+    """Проверяет наличие uv и устанавливает его при необходимости"""
+    try:
+        subprocess.run(
+            "uv --version",
+            shell=True,
+            capture_output=True,
+            check=True,
+        )
+        print("uv is already installed")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Installing uv...")
+        # Устанавливаем uv через pip (один раз)
+        run(
+            f"{sys.executable} -m pip install uv",
+            "Installing uv package manager",
+        )
+
+
 def prepare_environment():
+    # Сначала убедимся что uv установлен
+    ensure_uv_installed()
+
     # Install PyTorch
-    # Use cuda 11.8 here for consistency with onnxruntime but that
+    # Use cuda 12.1 here for consistency with onnxruntime but that
     # does not really matter since they use cuda from different places anyway
     install_package(
         "torch",
         (
-            f"{sys.executable} -m pip install torch torchvision torchaudio "
-            "--index-url https://download.pytorch.org/whl/cu121"
+            f"uv pip install torch torchvision torchaudio "
+            f"--index-url https://download.pytorch.org/whl/cu128 "
+            f"--python {sys.executable}"
         ),
     )
 
@@ -52,7 +75,7 @@ def prepare_environment():
     requirements_path = os.path.join(os.getcwd(), "requirements.txt")
     if os.path.exists(requirements_path):
         run(
-            f"{sys.executable} -m pip install -r {requirements_path}",
+            f"uv pip install -r {requirements_path} --python {sys.executable}",
             "Installing requirements from requirements.txt",
         )
 
@@ -61,7 +84,7 @@ def prepare_environment():
     if os.path.exists(waifuc_path):
         os.chdir(waifuc_path)
         run(
-            f"{sys.executable} -m pip install .",
+            f"uv pip install . --python {sys.executable}",
             "Installing waifuc package",
         )
 
