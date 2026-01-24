@@ -1,98 +1,40 @@
+import safetensors
 import os
+os.environ["PYTORCH_INDUCTOR_CACHE_DIR"] = "/home/user/cache"
 import logging
 from tqdm import tqdm
-from typing import List, Tuple, Set, Optional, Dict
-from PIL import Image, ImageFilter
+from typing import List, Tuple, Set, Optional
+import pillow_jxl
+from PIL import Image
 from pathlib import Path
 import subprocess
 import time
-import io
-import threading
-from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
 import timm
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn import DataParallel
 from .basics import get_related_paths, get_images_recursively
+import warnings
+import torch.backends.cudnn as cudnn
+from concurrent.futures import ThreadPoolExecutor
 
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Optional FAISS (recommended). If absent, code falls back to slower numpy chunking.
+# FAISS support
 try:
-    import faiss  # type: ignore
+    import faiss
     FAISS_AVAILABLE = True
-except Exception:
+except ImportError:
     FAISS_AVAILABLE = False
 
 
-def get_physical_core_count(logger: Optional[logging.Logger] = None) -> int:
-    """
-    Linux: try /sys topology (best), fallback to /proc/cpuinfo, then os.cpu_count().
-    Returns physical cores (not logical threads).
-    """
-    if logger is None:
-        logger = logging.getLogger()
-
-    # 1) /sys topology: count unique (package, core_id)
-    try:
-        topo_root = "/sys/devices/system/cpu"
-        cores = set()
-        if os.path.isdir(topo_root):
-            for name in os.listdir(topo_root):
-                if not name.startswith("cpu"):
-                    continue
-                suffix = name[3:]
-                if not suffix.isdigit():
-                    continue
-                cpu_dir = os.path.join(topo_root, name, "topology")
-                core_id_path = os.path.join(cpu_dir, "core_id")
-                pkg_id_path = os.path.join(cpu_dir, "physical_package_id")
-                if os.path.exists(core_id_path) and os.path.exists(pkg_id_path):
-                    with open(core_id_path, "r") as f:
-                        core_id = f.read().strip()
-                    with open(pkg_id_path, "r") as f:
-                        pkg_id = f.read().strip()
-                    cores.add((pkg_id, core_id))
-        if cores:
-            return len(cores)
-    except Exception as e:
-        logger.debug(f"Failed to detect physical cores via /sys topology: {e}")
-
-    # 2) /proc/cpuinfo fallback: unique (physical id, core id)
-    try:
-        if os.path.exists("/proc/cpuinfo"):
-            physical_cores = set()
-            physical_id = None
-            core_id = None
-            with open("/proc/cpuinfo", "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("physical id"):
-                        physical_id = line.split(":")[1].strip()
-                    elif line.startswith("core id"):
-                        core_id = line.split(":")[1].strip()
-                    elif line == "":
-                        if physical_id is not None and core_id is not None:
-                            physical_cores.add((physical_id, core_id))
-                        physical_id = None
-                        core_id = None
-            if physical_cores:
-                return len(physical_cores)
-    except Exception as e:
-        logger.debug(f"Failed to detect physical cores via /proc/cpuinfo: {e}")
-
-    # 3) last resort
-    return max(1, os.cpu_count() or 1)
-
-
-def get_file_size(file_path: str) -> int:
-    return os.path.getsize(file_path)
-
-
 class ImageDataset(Dataset):
-
     def __init__(self, image_paths: List[str], transform: callable):
         self.image_paths = image_paths
         self.transform = transform
@@ -100,13 +42,9 @@ class ImageDataset(Dataset):
     def __len__(self):
         return len(self.image_paths)
 
-    def __getitem__(self, idx: int) -> Tuple[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[str, np.ndarray]:
         image_path = self.image_paths[idx]
-        try:
-            image = Image.open(image_path).convert("RGB")
-        except Exception:
-            # Do not crash the whole pipeline on a single bad file.
-            image = Image.new("RGB", (224, 224), color=(0, 0, 0))
+        image = Image.open(image_path).convert("RGB")
         if self.transform:
             image = self.transform(image)
         return image_path, image
@@ -115,10 +53,6 @@ class ImageDataset(Dataset):
     def from_directory(cls, dataset_dir: str, transform: callable):
         image_paths = get_images_recursively(dataset_dir)
         return cls(image_paths, transform)
-
-    @classmethod
-    def get_file_size(file_path):
-        return os.path.getsize(file_path)
 
     @classmethod
     def from_subdirectories(cls, dataset_dir: str, transform: callable, portion: Optional[str] = "first"):
@@ -132,7 +66,6 @@ class ImageDataset(Dataset):
                 image_files = get_images_recursively(subdir_path)
                 if not image_files:
                     continue
-
                 image_numbers = [get_image_number(f) for f in image_files]
                 sorted_files = [x for _, x in sorted(zip(image_numbers, image_files))]
 
@@ -140,15 +73,9 @@ class ImageDataset(Dataset):
                 threshold = max_number // 3
 
                 if portion == "first":
-                    selected_files = [
-                        f for f in sorted_files if get_image_number(f) <= threshold
-                    ]
+                    selected_files = [f for f in sorted_files if get_image_number(f) <= threshold]
                 elif portion == "last":
-                    selected_files = [
-                        f
-                        for f in sorted_files
-                        if get_image_number(f) > 2 * threshold
-                    ]
+                    selected_files = [f for f in sorted_files if get_image_number(f) > 2 * threshold]
                 else:
                     raise ValueError("portion must be either 'first' or 'last'")
 
@@ -157,562 +84,655 @@ class ImageDataset(Dataset):
         return cls(image_paths, transform)
 
 
-class DuplicateRemover(object):
+def _is_distributed_initialized() -> bool:
+    """Проверяет, инициализировано ли распределённое окружение"""
+    return dist.is_available() and dist.is_initialized()
 
+
+def _is_launched_with_torchrun() -> bool:
+    """Проверяет, запущен ли скрипт через torchrun/torch.distributed.launch"""
+    return all(key in os.environ for key in ["RANK", "WORLD_SIZE", "LOCAL_RANK"])
+
+
+class DuplicateRemover:
     def __init__(
-        self,
-        model_name: str,
-        device: Optional[str] = None,
+        self, 
+        model_name: str, 
+        device: Optional[str] = None, 
         threshold: float = 0.96,
-        max_compare_size: int = 100000,
-        dataloader_batch_size: int = 12,
-        dataloader_num_workers: int = 6,
+        max_compare_size: int = 200000, 
+        dataloader_batch_size: int = 64, 
+        dataloader_num_workers: int = 124, 
         pin_memory: bool = True,
-        logger: Optional[logging.Logger] = None,
-        # --- new (safe defaults; do not break external calls) ---
-        max_iterations: int = 3,
-        k_neighbors: Optional[int] = None,              # if None -> adaptive 300..500
-        faiss_use_gpu: bool = False,                    # similarity search does NOT need GPU by default
-        sharpness_keep_ratio: float = 0.90,             # keep those >= ratio * best_sharpness, then PNG tie-break
-        score_image_max_side: int = 512,                # downscale for scoring (fast)
-        score_num_workers: Optional[int] = None,        # threads for scoring PNG/sharpness
-        rm_parallelism: int = 4,                        # xargs -P for rm
-        use_amp: bool = True,                           # AMP for embedding speed
+        use_faiss: bool = True,
+        faiss_exact_threshold: int = 40000,
+        logger: Optional[logging.Logger] = None
     ):
-
-        if logger is None:
-            self.logger = logging.getLogger()
+        self.logger = logger or logging.getLogger()
+        
+        # FAISS configuration
+        self.use_faiss = use_faiss and FAISS_AVAILABLE
+        self.faiss_exact_threshold = faiss_exact_threshold
+        
+        if use_faiss and not FAISS_AVAILABLE:
+            self.logger.warning("⚠️ FAISS requested but not available!")
+            self.logger.warning("   Install with: pip install faiss-gpu")
+            self.logger.warning("   Falling back to sklearn cosine_similarity")
+            self.use_faiss = False
+        
+        # Multi-GPU setup
+        self.world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        
+        # Проверяем, запущен ли скрипт в распределённом режиме
+        if _is_launched_with_torchrun():
+            # Запущено через torchrun — инициализируем DDP
+            if not _is_distributed_initialized():
+                self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+                
+                dist.init_process_group(
+                    backend="nccl",
+                    init_method="env://",
+                    world_size=self.world_size,
+                    rank=int(os.environ.get("RANK", 0))
+                )
+                self.logger.info(f"✅ Initialized DDP: rank={self.local_rank}, world_size={self.world_size}")
+            else:
+                self.local_rank = dist.get_rank()
+            
+            self.use_ddp = True
+            self.use_dp = False
+        elif self.world_size > 1:
+            # Несколько GPU, но обычный запуск — используем DataParallel
+            self.local_rank = 0
+            self.use_ddp = False
+            self.use_dp = True
+            self.logger.info(f"🔧 Using DataParallel with {self.world_size} GPUs")
         else:
-            self.logger = logger
-
-        if device is None:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            # Одна GPU или CPU
+            self.local_rank = 0
+            self.use_ddp = False
+            self.use_dp = False
+        
+        if torch.cuda.is_available():
+            self.device = f"cuda:{self.local_rank}" if self.use_ddp else "cuda:0"
         else:
-            self.device = device
+            self.device = "cpu"
+            self.use_ddp = False
+            self.use_dp = False
+            self.use_faiss = False
 
-        self.threshold = float(threshold)
-        self.max_compare_size = int(max_compare_size)  # kept for compatibility (not used in FAISS path)
-        self.dataloader_batch_size = int(dataloader_batch_size)
-        self.dataloader_num_workers = int(dataloader_num_workers)
-        self.pin_memory = bool(pin_memory)
+        # GPU optimizations
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.fastest = True
+            torch.use_deterministic_algorithms(False)
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
 
-        self.max_iterations = int(max_iterations)
-        self.k_neighbors = k_neighbors
-        self.faiss_use_gpu = bool(faiss_use_gpu)
-        self.sharpness_keep_ratio = float(sharpness_keep_ratio)
-        self.score_image_max_side = int(score_image_max_side)
-        self.rm_parallelism = int(rm_parallelism)
-        self.use_amp = bool(use_amp)
-
-        # scoring workers: default = physical cores (Linux), not SMT threads
-        if score_num_workers is None:
-            self.score_num_workers = get_physical_core_count(self.logger)
+        self.model = None
+        self.threshold = threshold
+        self.max_compare_size = max_compare_size
+        
+        # Batch size calculation
+        if self.use_ddp:
+            self.effective_batch_size = dataloader_batch_size
+            self.dataloader_batch_size = dataloader_batch_size // self.world_size
+        elif self.use_dp:
+            # DataParallel автоматически распределяет батч
+            self.effective_batch_size = dataloader_batch_size
+            self.dataloader_batch_size = dataloader_batch_size
         else:
-            self.score_num_workers = int(score_num_workers)
-
-        # ---- model / transform ----
-        self.logger.info(f"Loading {model_name} ...")
-
-        # Prefer embedding head (num_classes=0) if supported by timm model
-        try:
-            self.model = timm.create_model(model_name, pretrained=True, num_classes=0, global_pool="avg")
-        except Exception:
-            # fallback to original behavior
-            self.model = timm.create_model(model_name, pretrained=True)
-
-        # Multi-GPU embeddings: DataParallel
-        self._num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        if str(self.device).startswith("cuda") and self._num_gpus > 1 and (device is None or device == "cuda"):
-            self.logger.info(f"Using DataParallel for embeddings across {self._num_gpus} GPUs")
-            self.model = nn.DataParallel(self.model)
-
-        self.model = self.model.to(self.device)
-        self.model.eval()
-
-        self.data_cfg = timm.data.resolve_data_config(
-            self.model.module.pretrained_cfg if isinstance(self.model, nn.DataParallel) else self.model.pretrained_cfg
+            self.effective_batch_size = dataloader_batch_size
+            self.dataloader_batch_size = dataloader_batch_size
+            
+        self.dataloader_num_workers = min(
+            os.cpu_count() // max(self.world_size, 1), 
+            dataloader_num_workers
         )
+        self.pin_memory = pin_memory
+        
+        self.model_name = model_name
+        self._initialize_model()
+        
+        # Log configuration
+        if self.local_rank == 0:
+            self.logger.info(f"{'='*70}")
+            self.logger.info(f"🔧 DuplicateRemover Configuration:")
+            self.logger.info(f"   Similarity backend: {'FAISS' if self.use_faiss else 'sklearn'}")
+            if self.use_faiss:
+                self.logger.info(f"   FAISS exact search up to: {self.faiss_exact_threshold:,} images")
+                self.logger.info(f"   Above {self.faiss_exact_threshold:,}: IVF approximate search")
+            self.logger.info(f"   Transitivity: ENABLED (groups similar images)")
+            self.logger.info(f"   Threshold: {self.threshold}")
+            self.logger.info(f"   GPUs: {self.world_size}")
+            
+            if self.use_ddp:
+                self.logger.info(f"   Mode: DistributedDataParallel (DDP)")
+                self.logger.info(f"   Batch size: {self.effective_batch_size} ({self.dataloader_batch_size}/GPU)")
+            elif self.use_dp:
+                self.logger.info(f"   Mode: DataParallel (DP)")
+                self.logger.info(f"   Batch size: {self.dataloader_batch_size}")
+            else:
+                self.logger.info(f"   Mode: Single GPU/CPU")
+                self.logger.info(f"   Batch size: {self.dataloader_batch_size}")
+            self.logger.info(f"{'='*70}\n")
+
+    def _initialize_model(self):
+        """Инициализация модели"""
+        if self.local_rank == 0:
+            mode = "DDP" if self.use_ddp else ("DataParallel" if self.use_dp else "Single")
+            self.logger.info(f"🚀 Initializing model ({mode} mode, {self.world_size} GPU(s))")
+        
+        self.model = self.load_model_on_gpus(self.model_name)
+        
+        # Получаем pretrained_cfg в зависимости от типа обёртки
+        if self.use_ddp or self.use_dp:
+            base_model = self.model.module
+        else:
+            base_model = self.model
+        
+        # Для torch.compile модель может быть обёрнута
+        if hasattr(base_model, 'pretrained_cfg'):
+            self.data_cfg = timm.data.resolve_data_config(base_model.pretrained_cfg)
+        elif hasattr(base_model, '_orig_mod') and hasattr(base_model._orig_mod, 'pretrained_cfg'):
+            self.data_cfg = timm.data.resolve_data_config(base_model._orig_mod.pretrained_cfg)
+        else:
+            # Fallback: загружаем конфиг отдельно
+            temp_model = timm.create_model(self.model_name, pretrained=False)
+            self.data_cfg = timm.data.resolve_data_config(temp_model.pretrained_cfg)
+            del temp_model
+            
         self.transform = timm.data.create_transform(**self.data_cfg)
 
-        # ---- hybrid scoring cache (path -> (res_px, sharpness, png_size)) ----
-        self._score_cache: Dict[str, Tuple[int, float, int]] = {}
-        self._score_cache_lock = threading.Lock()
-
-        # Laplacian kernel in PIL (fast)
-        self._laplacian_filter = ImageFilter.Kernel(
-            size=(3, 3),
-            kernel=[0, 1, 0,
-                    1, -4, 1,
-                    0, 1, 0],
-            scale=1,
-            offset=0
-        )
-
-        # Keep FAISS GPU resources alive if enabled (single-GPU path)
-        self._faiss_res = None
-        if FAISS_AVAILABLE and self.faiss_use_gpu and torch.cuda.is_available():
-            try:
-                self._faiss_res = faiss.StandardGpuResources()
-            except Exception as e:
-                self.logger.warning(f"Could not init FAISS GPU resources, falling back to CPU FAISS: {e}")
-                self._faiss_res = None
-                self.faiss_use_gpu = False
-
-        if not FAISS_AVAILABLE:
-            self.logger.warning(
-                "FAISS not available. Similarity search fallback is much slower. "
-                "Consider installing faiss-cpu / faiss-gpu."
-            )
-
-        # ---- FAISS CPU threads: use physical cores (exactness unchanged) ----
-        self._faiss_cpu_threads = get_physical_core_count(self.logger)
-        if FAISS_AVAILABLE:
-            try:
-                faiss.omp_set_num_threads(self._faiss_cpu_threads)
-                self.logger.info(f"FAISS CPU threads set to {self._faiss_cpu_threads} (physical cores)")
-            except Exception as e:
-                self.logger.warning(f"Could not set FAISS CPU threads: {e}")
-
-        # Keep dataset reference like the original code did (some pipelines expect this attr)
-        self.dataset = None
-
-    # ---------------- embeddings ----------------
-
-    def compute_embeddings(self, dataset: ImageDataset) -> Tuple[List[str], np.ndarray]:
+    def load_model_on_gpus(self, model_name):
+        """Загрузка модели с оптимизациями"""
+        if self.local_rank == 0:
+            self.logger.info(f"Loading model: {model_name}")
+        
+        model = timm.create_model(model_name, pretrained=True)
+        model.eval()
+        
+        if torch.cuda.is_available():
+            model = model.to(self.device)
+            
+            # ================================================================
+            # torch.compile ТОЛЬКО для single GPU или DDP
+            # DataParallel несовместим с torch.compile!
+            # ================================================================
+            if not self.use_dp:
+                if self.local_rank == 0:
+                    self.logger.info("🔥 Compiling model with torch.compile(mode='max-autotune')")
+                
+                try:
+                    model = torch.compile(model, mode="max-autotune", fullgraph=False)
+                    if self.local_rank == 0:
+                        self.logger.info("✅ torch.compile enabled")
+                except Exception as e:
+                    if self.local_rank == 0:
+                        self.logger.warning(f"⚠️ torch.compile failed: {e}")
+            else:
+                if self.local_rank == 0:
+                    self.logger.info("⚠️ torch.compile skipped (incompatible with DataParallel)")
+            
+            # Выбираем способ параллелизации
+            if self.use_ddp:
+                model = DDP(model, device_ids=[self.local_rank], output_device=self.local_rank)
+            elif self.use_dp:
+                model = DataParallel(model)
+                if self.local_rank == 0:
+                    self.logger.info(f"✅ DataParallel enabled on {self.world_size} GPUs")
+            
+            # Warmup
+            with torch.no_grad():
+                test_input = torch.randn(1, 3, 448, 448).to(self.device)
+                _ = model(test_input)
+            
+            if self.local_rank == 0:
+                self.logger.info("✅ Model verification successful")
+                mem_allocated = torch.cuda.memory_allocated(self.device) / 1024**2
+                mem_reserved = torch.cuda.memory_reserved(self.device) / 1024**2
+                self.logger.info(f"   GPU memory: {mem_allocated:.0f}MB allocated, {mem_reserved:.0f}MB reserved")
+        
+        return model
+    
+    def compute_embeddings(self, dataset: ImageDataset) -> np.ndarray:
+        """Вычисление эмбеддингов"""
+        if self.use_ddp:
+            sampler = DistributedSampler(dataset, shuffle=False)
+        else:
+            sampler = None
+        
         dataloader = DataLoader(
             dataset,
             batch_size=self.dataloader_batch_size,
             num_workers=self.dataloader_num_workers,
-            pin_memory=self.pin_memory and str(self.device).startswith("cuda"),
+            pin_memory=self.pin_memory,
+            prefetch_factor=2,
             shuffle=False,
-            persistent_workers=self.dataloader_num_workers > 0,
-            prefetch_factor=2 if self.dataloader_num_workers > 0 else None,
+            sampler=sampler,
+            persistent_workers=True if self.dataloader_num_workers > 0 else False,
         )
 
-        all_paths: List[str] = []
-        chunks: List[np.ndarray] = []
-
-        use_cuda = str(self.device).startswith("cuda")
-        amp_enabled = bool(self.use_amp and use_cuda)
-        amp_device_type = "cuda" if use_cuda else "cpu"
-
-        with torch.no_grad(), torch.autocast(device_type=amp_device_type, enabled=amp_enabled):
-            for batch_paths, images in tqdm(dataloader, desc="Computing embeddings"):
+        embeddings = []
+        with torch.no_grad():
+            for _, images in tqdm(
+                dataloader, 
+                desc="Computing embeddings", 
+                leave=False,
+                disable=self.use_ddp and self.local_rank != 0
+            ):
                 images = images.to(self.device, non_blocking=True)
-                feats = self.model(images)
+                features = self.model(images)
+                embeddings.append(features.cpu().numpy())
 
-                # Make robust across different timm model outputs
-                if isinstance(feats, (tuple, list)):
-                    feats = feats[0]
-                if isinstance(feats, dict):
-                    feats = feats.get("features", next(iter(feats.values())))
+        local_embeddings = np.vstack(embeddings)
+        
+        if self.use_ddp:
+            # Gather embeddings from all GPUs
+            local_size = torch.tensor([local_embeddings.shape[0]], device=self.device)
+            sizes = [torch.zeros_like(local_size) for _ in range(self.world_size)]
+            dist.all_gather(sizes, local_size)
+            
+            max_size = max([s.item() for s in sizes])
+            padded_embeddings = np.zeros((max_size, local_embeddings.shape[1]), dtype=local_embeddings.dtype)
+            padded_embeddings[:local_embeddings.shape[0]] = local_embeddings
+            
+            tensor_embeddings = torch.from_numpy(padded_embeddings).to(self.device)
+            gathered = [torch.zeros_like(tensor_embeddings) for _ in range(self.world_size)]
+            dist.all_gather(gathered, tensor_embeddings)
+            
+            all_embeddings = []
+            for i, size in enumerate(sizes):
+                all_embeddings.append(gathered[i][:size.item()].cpu().numpy())
+            
+            return np.vstack(all_embeddings)
+        
+        return local_embeddings
 
-                if hasattr(feats, "ndim") and feats.ndim == 4:
-                    feats = feats.mean(dim=(-2, -1))  # global average pool
-
-                chunks.append(feats.detach().cpu().float().numpy())
-                all_paths.extend(list(batch_paths))
-
-        emb = np.vstack(chunks) if chunks else np.empty((0, 0), dtype=np.float32)
-        return all_paths, emb
-
-    # ---------------- hybrid scoring ----------------
-
-    def _score_image_uncached(self, path: str) -> Tuple[int, float, int]:
-        """
-        Hybrid metrics (CPU):
-          - res_px: width*height (from original image)
-          - sharpness: Laplacian variance on downscaled grayscale
-          - png_size: in-memory PNG (compress_level=1) size on downscaled RGB
-        """
-        try:
-            im = Image.open(path)
-            w, h = im.size
-            res_px = int(w) * int(h)
-
-            # Downscale for scoring (much faster)
-            max_side = max(w, h)
-            if max_side > self.score_image_max_side:
-                scale = self.score_image_max_side / float(max_side)
-                nw = max(1, int(w * scale))
-                nh = max(1, int(h * scale))
-                im = im.resize((nw, nh), resample=Image.BICUBIC)
-
-            im_rgb = im.convert("RGB")
-            im_gray = im_rgb.convert("L")
-
-            # Sharpness via Laplacian variance
-            lap = im_gray.filter(self._laplacian_filter)
-            arr = np.asarray(lap, dtype=np.float32)
-            sharpness = float(arr.var())
-
-            # PNG size (compress=1) in memory
-            buf = io.BytesIO()
-            im_rgb.save(buf, format="PNG", compress_level=1, optimize=False)
-            png_size = int(buf.tell())
-
-            return res_px, sharpness, png_size
-        except Exception:
-            return 0, 0.0, 0
-
-    def _ensure_scores(self, paths: List[str]) -> None:
-        missing = []
-        with self._score_cache_lock:
-            for p in paths:
-                if p not in self._score_cache:
-                    missing.append(p)
-
-        if not missing:
-            return
-
-        results: Dict[str, Tuple[int, float, int]] = {}
-
-        # Do not create more threads than tasks
-        max_workers = min(self.score_num_workers, len(missing))
-        if max_workers <= 1:
-            for p in missing:
-                results[p] = self._score_image_uncached(p)
-        else:
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                for p, score in zip(missing, ex.map(self._score_image_uncached, missing)):
-                    results[p] = score
-
-        with self._score_cache_lock:
-            self._score_cache.update(results)
-
-    def _choose_best_in_component(self, member_ids: List[int], paths: List[str]) -> int:
-        """
-        Selection inside a duplicate-component:
-          1) Prefer max resolution (w*h)
-          2) Among those, prefer max sharpness (Laplacian var)
-          3) Among sufficiently sharp (>= ratio * best), prefer max PNG-size(compress=1)
-          4) Deterministic tie-breaker by path
-        Returns: member_id (local index) to KEEP
-        """
-        comp_paths = [paths[i] for i in member_ids]
-        self._ensure_scores(comp_paths)
-
-        res: Dict[int, int] = {}
-        sharp: Dict[int, float] = {}
-        png: Dict[int, int] = {}
-
-        with self._score_cache_lock:
-            for mid in member_ids:
-                rp, sh, ps = self._score_cache.get(paths[mid], (0, 0.0, 0))
-                res[mid] = rp
-                sharp[mid] = sh
-                png[mid] = ps
-
-        # 1) resolution gate
-        max_res = max(res.values())
-        candidates = [i for i in member_ids if res[i] == max_res]
-        if len(candidates) == 1:
-            return candidates[0]
-
-        # 2) sharpness gate
-        best_sharp = max(sharp[i] for i in candidates)
-        if best_sharp <= 0:
-            # fallback purely to png size, then path
-            return max(candidates, key=lambda i: (png[i], paths[i]))
-
-        keep_sharp = best_sharp * self.sharpness_keep_ratio
-        sharp_candidates = [i for i in candidates if sharp[i] >= keep_sharp]
-        if len(sharp_candidates) == 1:
-            return sharp_candidates[0]
-
-        # 3) png-size tie-break among sufficiently sharp
-        return max(sharp_candidates, key=lambda i: (png[i], sharp[i], paths[i]))
-
-    # ---------------- similarity / duplicates ----------------
-
+    def get_file_sizes(self, indices: np.ndarray) -> dict:
+        """Получить размеры файлов параллельно"""
+        with ThreadPoolExecutor(max_workers=min(120, len(indices))) as executor:
+            paths = [self.dataset.image_paths[idx] for idx in indices]
+            sizes = list(executor.map(self._get_file_size, paths))
+            return dict(zip(indices, sizes))
+    
     @staticmethod
-    def _l2_normalize(x: np.ndarray) -> np.ndarray:
-        x = x.astype(np.float32, copy=False)
-        norms = np.linalg.norm(x, axis=1, keepdims=True)
-        return x / (norms + 1e-8)
+    def _get_file_size(file_path: str) -> int:
+        try:
+            return os.path.getsize(file_path)
+        except:
+            return 0
 
-    class _UnionFind:
-        def __init__(self, n: int):
-            self.parent = np.arange(n, dtype=np.int32)
-            self.rank = np.zeros(n, dtype=np.int8)
-
-        def find(self, x: int) -> int:
-            parent = self.parent
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(self, a: int, b: int) -> None:
-            ra = self.find(a)
-            rb = self.find(b)
-            if ra == rb:
-                return
-            rank = self.rank
-            parent = self.parent
-            if rank[ra] < rank[rb]:
-                parent[ra] = rb
-            elif rank[ra] > rank[rb]:
-                parent[rb] = ra
-            else:
-                parent[rb] = ra
-                rank[ra] += 1
-
-    def _adaptive_k(self, n: int) -> int:
-        if n <= 1:
-            return 1
-        if self.k_neighbors is not None:
-            return max(2, min(int(self.k_neighbors), n))
-        # defaults tuned for anime frames:
-        # - minimum 300
-        # - cap at 500 to limit work
-        # - for small n -> k=n
-        return min(n, max(300, min(500, n // 100 if n >= 10000 else 300)))
-
-    def _find_duplicates_single_pass_faiss(
-        self,
-        embeddings: np.ndarray,
-        paths: List[str],
-    ) -> Tuple[Set[int], Set[int]]:
+    def find_duplicates_faiss(self, embeddings: np.ndarray) -> Set[int]:
         """
-        Build components via kNN edges (cosine similarity > threshold),
-        then select 1 best per component using hybrid scoring.
-        Returns (local_indices_to_remove, local_indices_to_keep).
+        Поиск дубликатов с FAISS — С транзитивностью (как в оригинале).
+        До faiss_exact_threshold — точный поиск, выше — IVF.
         """
-        n = len(embeddings)
-        if n <= 1:
-            return set(), set(range(n))
-
-        # Ensure CPU FAISS uses all physical cores (exactness unchanged)
-        if FAISS_AVAILABLE and (not self.faiss_use_gpu or self._faiss_res is None):
+        n, d = embeddings.shape
+        
+        if self.local_rank == 0:
+            self.logger.info(f"🔍 Finding duplicates using FAISS (n={n:,}, d={d})")
+        
+        # Получаем размеры файлов
+        if self.local_rank == 0:
+            self.logger.info("   Getting file sizes...")
+        
+        all_indices = np.arange(n)
+        file_sizes = self.get_file_sizes(all_indices)
+        file_sizes_array = np.array([file_sizes[i] for i in range(n)])
+        
+        # Нормализуем для косинусного сходства
+        if self.local_rank == 0:
+            self.logger.info("   Normalizing embeddings...")
+        
+        embeddings = embeddings.astype('float32')
+        faiss.normalize_L2(embeddings)
+        
+        # Выбираем тип индекса
+        use_exact = n <= self.faiss_exact_threshold
+        
+        if use_exact:
+            if self.local_rank == 0:
+                self.logger.info(f"   Using EXACT search (IndexFlatIP)")
+                self.logger.info(f"   Accuracy: 100% (identical to full matrix)")
+            index = faiss.IndexFlatIP(d)
+        else:
+            nlist = min(int(4 * np.sqrt(n)), 4096)
+            nprobe = max(nlist // 2, 128)
+            
+            if self.local_rank == 0:
+                self.logger.info(f"   Using IVF approximate search")
+                self.logger.info(f"   nlist={nlist}, nprobe={nprobe}")
+                self.logger.info(f"   Expected accuracy: >99.5%")
+            
+            quantizer = faiss.IndexFlatIP(d)
+            index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+            index.nprobe = nprobe
+        
+        # GPU acceleration
+        if torch.cuda.is_available():
             try:
-                faiss.omp_set_num_threads(self._faiss_cpu_threads)
-            except Exception:
-                pass
-
-        k = self._adaptive_k(n)
-
-        emb = self._l2_normalize(embeddings)
-        d = emb.shape[1]
-
-        index = faiss.IndexFlatIP(d)
-
-        # Keep similarity search on CPU by default
-        if self.faiss_use_gpu and self._faiss_res is not None:
-            index = faiss.index_cpu_to_gpu(self._faiss_res, 0, index)
-
-        index.add(emb)
-
-        uf = self._UnionFind(n)
-
-        # Stream union edges without storing full (n,k) matrices
-        batch_size = 10000
-        for start in tqdm(range(0, n, batch_size), desc=f"FAISS kNN (k={k})"):
-            end = min(start + batch_size, n)
-            sims, neigh = index.search(emb[start:end], k)
-
-            for i in range(end - start):
-                src = start + i
-                row_sims = sims[i]
-                row_neigh = neigh[i]
-                for j in range(len(row_neigh)):
-                    dst = int(row_neigh[j])
-                    if dst < 0 or dst == src:
-                        continue
-                    if float(row_sims[j]) > self.threshold:
-                        uf.union(src, dst)
-
-        # Group members by component root
-        groups: Dict[int, List[int]] = {}
-        for i in range(n):
-            r = uf.find(i)
-            groups.setdefault(r, []).append(i)
-
-        to_remove: Set[int] = set()
-        to_keep: Set[int] = set()
-
-        for members in groups.values():
-            if len(members) <= 1:
-                to_keep.add(members[0])
-                continue
-            keep = self._choose_best_in_component(members, paths)
-            to_keep.add(keep)
-            for m in members:
-                if m != keep:
-                    to_remove.add(m)
-
-        return to_remove, to_keep
-
-    def _find_duplicates_single_pass_numpy(
-        self,
-        embeddings: np.ndarray,
-        paths: List[str],
-        chunk_size: int = 5000,
-    ) -> Tuple[Set[int], Set[int]]:
-        """
-        Slow fallback if FAISS is missing.
-        Still O(n^2) worst-case; intended only as fallback.
-        Returns (local_indices_to_remove, local_indices_to_keep).
-        """
-        n = len(embeddings)
-        if n <= 1:
-            return set(), set(range(n))
-
-        emb = self._l2_normalize(embeddings)
-        uf = self._UnionFind(n)
-
-        for start in tqdm(range(0, n, chunk_size), desc="Numpy similarity chunks"):
-            end = min(start + chunk_size, n)
-            sims = emb[start:end] @ emb.T  # (chunk, n)
-            for i in range(end - start):
-                src = start + i
-                row = sims[i]
-                row[src] = 0.0
-                dsts = np.where(row > self.threshold)[0]
-                for dst in dsts.tolist():
-                    uf.union(src, int(dst))
-
-        groups: Dict[int, List[int]] = {}
-        for i in range(n):
-            r = uf.find(i)
-            groups.setdefault(r, []).append(i)
-
-        to_remove: Set[int] = set()
-        to_keep: Set[int] = set()
-
-        for members in groups.values():
-            if len(members) <= 1:
-                to_keep.add(members[0])
-                continue
-            keep = self._choose_best_in_component(members, paths)
-            to_keep.add(keep)
-            for m in members:
-                if m != keep:
-                    to_remove.add(m)
-
-        return to_remove, to_keep
-
-    def find_duplicates_iterative(self, embeddings: np.ndarray, paths: List[str]) -> Set[int]:
-        """
-        Iterative passes handle cases where kNN graph misses some edges for huge near-identical clusters.
-        Returns global indices to remove.
-        """
-        all_to_remove: Set[int] = set()
-        remaining = np.arange(len(embeddings), dtype=np.int32)
-
-        for it in range(self.max_iterations):
-            if len(remaining) <= 1:
-                break
-
-            cur_emb = embeddings[remaining]
-            cur_paths = [paths[int(i)] for i in remaining]
-
-            self.logger.info(f"Duplicate pass {it + 1}/{self.max_iterations}: {len(remaining)} images")
-
-            if FAISS_AVAILABLE:
-                local_remove, _local_keep = self._find_duplicates_single_pass_faiss(cur_emb, cur_paths)
+                if self.local_rank == 0:
+                    self.logger.info("   Moving FAISS index to GPU...")
+                
+                res = faiss.StandardGpuResources()
+                # Увеличиваем временную память для больших индексов
+                res.setTempMemory(2 * 1024 * 1024 * 1024)  # 2GB
+                
+                index = faiss.index_cpu_to_gpu(res, 0, index)
+                
+                if self.local_rank == 0:
+                    self.logger.info("   ✅ FAISS using GPU acceleration")
+            except Exception as e:
+                if self.local_rank == 0:
+                    self.logger.warning(f"   ⚠️ GPU FAISS failed: {e}, using CPU")
+        
+        # Обучаем если нужно
+        if hasattr(index, 'is_trained') and not index.is_trained:
+            if self.local_rank == 0:
+                self.logger.info("   Training index...")
+            
+            train_size = min(n, 100000)
+            if train_size < n:
+                train_indices = np.random.choice(n, train_size, replace=False)
+                index.train(embeddings[train_indices])
             else:
-                local_remove, _local_keep = self._find_duplicates_single_pass_numpy(cur_emb, cur_paths)
+                index.train(embeddings)
+        
+        # Добавляем векторы
+        if self.local_rank == 0:
+            self.logger.info("   Adding vectors to index...")
+        index.add(embeddings)
+        
+        # Ищем k ближайших соседей (больше для транзитивности)
+        k = min(100, n)
+        
+        if self.local_rank == 0:
+            self.logger.info(f"   Searching for {k} nearest neighbors per image...")
+        
+        search_start = time.time()
+        similarities, neighbor_indices = index.search(embeddings, k)
+        search_time = time.time() - search_start
+        
+        if self.local_rank == 0:
+            self.logger.info(f"   Search completed in {search_time:.2f}s")
+            self.logger.info(f"   Throughput: {n*k/search_time:,.0f} comparisons/sec")
+        
+        # ========================================================================
+        # ОРИГИНАЛЬНАЯ ЛОГИКА С ТРАНЗИТИВНОСТЬЮ
+        # ========================================================================
+        
+        if self.local_rank == 0:
+            self.logger.info("   Processing with transitivity (grouping similar images)...")
+        
+        samples_to_remove = set()
+        samples_to_keep = set()
+        groups_found = 0
+        
+        for i in tqdm(
+            range(n), 
+            desc="   Finding duplicate groups", 
+            leave=False,
+            disable=self.local_rank != 0
+        ):
+            if i in samples_to_remove or i in samples_to_keep:
+                continue
+            
+            # Находим все похожие (включая себя)
+            similar_mask = similarities[i] > self.threshold
+            dup_local_idxs = np.where(similar_mask)[0]
+            
+            if len(dup_local_idxs) > 1:  # Есть дубликаты кроме себя
+                # Собираем ВСЕ похожие индексы (транзитивность!)
+                similar_images = [int(neighbor_indices[i, idx]) for idx in dup_local_idxs]
+                similar_images = [x for x in similar_images if x != -1]
+                
+                if len(similar_images) > 1:
+                    groups_found += 1
+                    
+                    # Оставляем самый БОЛЬШОЙ файл из группы
+                    largest_image = max(similar_images, key=lambda x: file_sizes_array[x])
+                    
+                    samples_to_keep.add(largest_image)
+                    samples_to_remove.update(set(similar_images) - {largest_image})
+            else:
+                # Нет дубликатов
+                samples_to_keep.add(i)
+        
+        if self.local_rank == 0:
+            self.logger.info(f"   Duplicate groups found: {groups_found:,}")
+            self.logger.info(f"   Files to remove: {len(samples_to_remove):,}")
+            self.logger.info(f"   Files to keep: {len(samples_to_keep):,}")
+        
+        return samples_to_remove
 
-            if not local_remove:
-                self.logger.info("No more duplicates found")
-                break
-
-            global_remove = {int(remaining[int(i)]) for i in local_remove}
-            all_to_remove.update(global_remove)
-
-            mask = np.ones(len(remaining), dtype=bool)
-            for i in local_remove:
-                mask[int(i)] = False
-            remaining = remaining[mask]
-
-            self.logger.info(f"Removed in pass: {len(local_remove)}; remaining: {len(remaining)}")
-
+    def find_duplicates_sklearn(self, embeddings: np.ndarray) -> Set[int]:
+        """
+        Fallback метод без FAISS (батчами, с транзитивностью)
+        """
+        from sklearn.metrics.pairwise import cosine_similarity
+        
+        n = len(embeddings)
+        
+        if self.local_rank == 0:
+            self.logger.info(f"🔍 Finding duplicates using sklearn (n={n:,})")
+            if n > 50000:
+                mem_needed_gb = (n * n * 4) / (1024**3)
+                self.logger.warning(f"   ⚠️ Large dataset! Memory needed: ~{mem_needed_gb:.1f} GB")
+                self.logger.warning(f"   Consider installing faiss-gpu for better performance")
+        
+        batch_size = 1280
+        remaining_indices = np.arange(n)
+        all_to_remove = set()
+        batch_num = 0
+        
+        while len(remaining_indices) > 0:
+            batch_num += 1
+            current_batch_size = min(batch_size, len(remaining_indices))
+            
+            if current_batch_size < len(remaining_indices):
+                batch_indices = np.random.choice(remaining_indices, current_batch_size, replace=False)
+            else:
+                batch_indices = remaining_indices
+    
+            if self.local_rank == 0:
+                self.logger.info(
+                    f"Batch {batch_num}: processing {current_batch_size} images "
+                    f"({len(remaining_indices)} remaining)"
+                )
+            
+            batch_embeddings = embeddings[batch_indices]
+            similarity_matrix = cosine_similarity(batch_embeddings)
+            similarity_matrix = similarity_matrix - np.identity(len(similarity_matrix))
+    
+            samples_to_remove = set()
+            samples_to_keep = set()
+            
+            file_sizes = self.get_file_sizes(batch_indices)
+    
+            for idx in range(len(batch_embeddings)):
+                sample_id = batch_indices[idx]
+                if sample_id not in samples_to_remove and sample_id not in samples_to_keep:
+                    dup_idxs = np.where(similarity_matrix[idx] > self.threshold)[0]
+                    
+                    if len(dup_idxs) > 0:
+                        # ТРАНЗИТИВНОСТЬ: группируем все похожие
+                        similar_images = [sample_id] + [batch_indices[dup] for dup in dup_idxs]
+                        largest_image = max(similar_images, key=lambda x: file_sizes[x])
+                        samples_to_keep.add(largest_image)
+                        samples_to_remove.update(set(similar_images) - {largest_image})
+                    else:
+                        samples_to_keep.add(sample_id)
+    
+            all_to_remove.update(samples_to_remove)
+            remaining_indices = np.array([
+                idx for idx in remaining_indices 
+                if idx not in samples_to_remove and idx not in samples_to_keep
+            ])
+            
+            if self.local_rank == 0:
+                self.logger.info(f"   Found {len(samples_to_remove)} duplicates in this batch")
+        
+        if self.local_rank == 0:
+            self.logger.info(f"   Total files to remove: {len(all_to_remove):,}")
+        
         return all_to_remove
 
-    # --- compatibility method (kept from original API shape) ---
-    def get_duplicate(
-        self, embeddings: np.ndarray, indices: Optional[np.ndarray] = None
-    ) -> Tuple[Set[int], Set[int]]:
-        """
-        Compatibility wrapper:
-        returns (samples_to_remove, samples_to_keep) as GLOBAL indices,
-        using the same hybrid logic and FAISS (if available).
-        """
-        if indices is None:
-            indices = np.arange(len(embeddings))
-
-        idx_list = indices.tolist()
-        sub_emb = embeddings[indices]
-
-        # Prefer dataset order paths if available
-        if self.dataset is not None and hasattr(self.dataset, "image_paths"):
-            sub_paths = [self.dataset.image_paths[i] for i in idx_list]
-        else:
-            # last resort: dummy paths (keeps deterministic but scoring will be poor)
-            sub_paths = [str(i) for i in idx_list]
-
-        if FAISS_AVAILABLE:
-            local_remove, local_keep = self._find_duplicates_single_pass_faiss(sub_emb, sub_paths)
-        else:
-            local_remove, local_keep = self._find_duplicates_single_pass_numpy(sub_emb, sub_paths)
-
-        global_remove = {idx_list[i] for i in local_remove}
-        global_keep = {idx_list[i] for i in local_keep}
-        return global_remove, global_keep
-
-    # ---------------- public API (pipeline) ----------------
-
     def remove_similar(self, dataset: ImageDataset):
+        """Основной метод удаления дубликатов"""
         start_time = time.time()
-        self.logger.info(f"Compute embeddings for {len(dataset)} images ...")
-        paths, embeddings = self.compute_embeddings(dataset)
-        self.logger.info(f"Embedding computation took: {time.time() - start_time:.2f} seconds")
-
-        if len(paths) <= 1:
+        
+        if self.local_rank == 0:
+            self.logger.info(f"Starting duplicate removal for {len(dataset):,} images...")
+        
+        # Вычисляем эмбеддинги
+        embeddings = self.compute_embeddings(dataset)
+        embedding_time = time.time() - start_time
+        
+        if self.local_rank == 0:
+            self.logger.info(f"✅ Embedding computation: {embedding_time:.2f}s")
+            self.logger.info(f"   Throughput: {len(dataset)/embedding_time:.1f} images/sec\n")
+    
+        # Только на rank 0 (или single GPU / DataParallel)
+        if self.use_ddp and self.local_rank != 0:
+            dist.barrier()
             return
-
-        start_time = time.time()
-        samples_to_remove = self.find_duplicates_iterative(embeddings, paths)
-        self.logger.info(f"Duplicate identification took: {time.time() - start_time:.2f} seconds")
-
-        if not samples_to_remove:
-            return
-
-        files_to_remove = [paths[i] for i in samples_to_remove]
-
-        start_time = time.time()
-        if len(files_to_remove) > 200:
-            # safe with spaces/newlines via -0, safe with leading dashes via rm -- ...
-            payload = ("\0".join(files_to_remove) + "\0").encode()
-            proc = subprocess.Popen(
-                ["xargs", "-0", "-P", str(self.rm_parallelism), "rm", "-f", "--"],
-                stdin=subprocess.PIPE,
-            )
-            proc.communicate(input=payload)
+        
+        # Сохраняем dataset для get_file_sizes
+        self.dataset = dataset
+        
+        # Поиск дубликатов
+        search_start = time.time()
+        
+        if self.use_faiss:
+            to_remove = self.find_duplicates_faiss(embeddings)
         else:
-            for f in files_to_remove:
+            to_remove = self.find_duplicates_sklearn(embeddings)
+        
+        search_time = time.time() - search_start
+        
+        self.logger.info(f"\n✅ Duplicate search: {search_time:.2f}s\n")
+        
+        # Удаляем файлы
+        if to_remove:
+            files_to_remove = [dataset.image_paths[idx] for idx in to_remove]
+            
+            # Подсчитываем размер
+            total_size = 0
+            for path in files_to_remove[:1000]:  # Sample для оценки
                 try:
-                    os.remove(f)
-                except OSError:
+                    total_size += os.path.getsize(path)
+                except:
                     pass
-        self.logger.info(f"File removal took: {time.time() - start_time:.2f} seconds")
+            
+            if len(files_to_remove) > 0:
+                estimated_total_gb = (total_size / min(1000, len(files_to_remove)) * len(files_to_remove)) / (1024**3)
+            else:
+                estimated_total_gb = 0
+            
+            self.logger.info(f"🗑️  Removing {len(files_to_remove):,} duplicate files...")
+            self.logger.info(f"   Estimated space to free: ~{estimated_total_gb:.2f} GB")
+            
+            removal_start = time.time()
+            batch_size = 1000
+            removed_count = 0
+            
+            for i in range(0, len(files_to_remove), batch_size):
+                batch = files_to_remove[i:i + batch_size]
+                try:
+                    subprocess.run(["rm"] + batch, check=True, stderr=subprocess.DEVNULL)
+                    removed_count += len(batch)
+                    
+                    if (i // batch_size + 1) % 10 == 0:
+                        progress = removed_count / len(files_to_remove) * 100
+                        self.logger.info(f"   Progress: {removed_count:,}/{len(files_to_remove):,} ({progress:.1f}%)")
+                except Exception as e:
+                    self.logger.error(f"   Error removing batch: {e}")
+            
+            removal_time = time.time() - removal_start
+            self.logger.info(f"✅ Removed {removed_count:,} files in {removal_time:.2f}s")
+            self.logger.info(f"   Throughput: {removed_count/removal_time:,.0f} files/sec")
+        else:
+            self.logger.info("✅ No duplicates found")
+        
+        total_time = time.time() - start_time
+        
+        self.logger.info(f"\n{'='*70}")
+        self.logger.info(f"📊 SUMMARY:")
+        self.logger.info(f"   Total images: {len(dataset):,}")
+        self.logger.info(f"   Duplicates removed: {len(to_remove):,}")
+        self.logger.info(f"   Unique images kept: {len(dataset) - len(to_remove):,}")
+        self.logger.info(f"   Total time: {total_time:.2f}s ({total_time/60:.2f} min)")
+        self.logger.info(f"{'='*70}\n")
+        
+        if self.use_ddp:
+            dist.barrier()
 
     def remove_similar_from_dir(self, dirpath: str, portion: Optional[str] = None):
-
+        """Удаление дубликатов из директории"""
         if portion:
-            rtype = "op" if portion == "first" else "ed"
-            self.logger.info(f"Removing {rtype} duplicates for '{dirpath}' ...")
+            rtype = "OP" if portion == "first" else "ED"
+            if self.local_rank == 0:
+                self.logger.info(f"{'='*70}")
+                self.logger.info(f"Processing {rtype} portion: {dirpath}")
+                self.logger.info(f"{'='*70}\n")
+            
             dataset = ImageDataset.from_subdirectories(
                 dataset_dir=dirpath, transform=self.transform, portion=portion
             )
         else:
-            self.logger.info(f"Removing duplicates for '{dirpath}' ...")
+            if self.local_rank == 0:
+                self.logger.info(f"{'='*70}")
+                self.logger.info(f"Processing directory: {dirpath}")
+                self.logger.info(f"{'='*70}\n")
+            
             dataset = ImageDataset.from_directory(dirpath, self.transform)
 
         if len(dataset) == 0:
+            if self.local_rank == 0:
+                self.logger.warning("No images found!")
             return
 
-        # keep reference like original pipeline might expect
         self.dataset = dataset
         self.remove_similar(dataset)
+
+    @staticmethod
+    def get_file_size(file_path):
+        """Статический метод для обратной совместимости"""
+        try:
+            return os.path.getsize(file_path)
+        except:
+            return 0
+    
+    def __del__(self):
+        """Cleanup при удалении объекта"""
+        if self.use_ddp and _is_distributed_initialized():
+            try:
+                dist.destroy_process_group()
+            except:
+                pass
+
+
+if __name__ == "__main__":
+    # Пример использования
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    remover = DuplicateRemover(
+        model_name="eva02_large_patch14_448.mim_m38m_ft_in22k_in1k",
+        threshold=0.91,
+        dataloader_batch_size=64,
+        dataloader_num_workers=32,
+        use_faiss=True,
+        faiss_exact_threshold=40000,
+        logger=logger
+    )
+    
+    remover.remove_similar_from_dir("./dataset")
