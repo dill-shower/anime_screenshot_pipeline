@@ -34,6 +34,16 @@ except ImportError:
     FAISS_AVAILABLE = False
 
 
+def _is_distributed_initialized() -> bool:
+    """Проверяет, инициализировано ли распределённое окружение"""
+    return dist.is_available() and dist.is_initialized()
+
+
+def _is_launched_with_torchrun() -> bool:
+    """Проверяет, запущен ли скрипт через torchrun/torch.distributed.launch"""
+    return all(key in os.environ for key in ["RANK", "WORLD_SIZE", "LOCAL_RANK"])
+
+
 class ImageDataset(Dataset):
     def __init__(self, image_paths: List[str], transform: callable):
         self.image_paths = image_paths
@@ -84,16 +94,6 @@ class ImageDataset(Dataset):
         return cls(image_paths, transform)
 
 
-def _is_distributed_initialized() -> bool:
-    """Проверяет, инициализировано ли распределённое окружение"""
-    return dist.is_available() and dist.is_initialized()
-
-
-def _is_launched_with_torchrun() -> bool:
-    """Проверяет, запущен ли скрипт через torchrun/torch.distributed.launch"""
-    return all(key in os.environ for key in ["RANK", "WORLD_SIZE", "LOCAL_RANK"])
-
-
 class DuplicateRemover:
     def __init__(
         self, 
@@ -125,7 +125,6 @@ class DuplicateRemover:
         
         # Проверяем, запущен ли скрипт в распределённом режиме
         if _is_launched_with_torchrun():
-            # Запущено через torchrun — инициализируем DDP
             if not _is_distributed_initialized():
                 self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
                 self.world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -162,16 +161,67 @@ class DuplicateRemover:
             self.use_dp = False
             self.use_faiss = False
 
-        # GPU optimizations
+        # ====================================================================
+        # GPU OPTIMIZATIONS: TF32, BF16, cuDNN AutoTune
+        # ====================================================================
+        self.autocast_dtype = None
+        
         if torch.cuda.is_available():
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cudnn.fastest = True
-            torch.use_deterministic_algorithms(False)
+            # Определяем compute capability
+            major, minor = torch.cuda.get_device_capability(self.device)
+            compute_cap = major + minor / 10
+            
+            if self.local_rank == 0:
+                self.logger.info(f"🔧 GPU Compute Capability: {major}.{minor}")
+            
+            # TF32 precision (Ampere и новее: compute capability >= 8.0)
+            if major >= 8:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                if self.local_rank == 0:
+                    self.logger.info("✅ TF32 enabled (Ampere or newer)")
+            else:
+                if self.local_rank == 0:
+                    self.logger.info("ℹ️  TF32 not available (requires Ampere or newer)")
+            
+            # BF16 support (Ampere и новее)
+            if major >= 8:
+                self.autocast_dtype = torch.bfloat16
+                if self.local_rank == 0:
+                    self.logger.info("✅ Using BF16 (bfloat16) autocast")
+            elif major >= 7:
+                # Volta/Turing поддерживают FP16
+                self.autocast_dtype = torch.float16
+                if self.local_rank == 0:
+                    self.logger.info("✅ Using FP16 (float16) autocast")
+            else:
+                if self.local_rank == 0:
+                    self.logger.info("ℹ️  Mixed precision not available on this GPU")
+            
+            # cuDNN AutoTune & Optimizations
+            torch.backends.cudnn.benchmark = True  # Auto-tune kernels
+            torch.backends.cudnn.enabled = True
+            torch.backends.cudnn.deterministic = False  # Для максимальной скорости
+            
+            if self.local_rank == 0:
+                self.logger.info("✅ cuDNN benchmark (auto-tune) enabled")
+            
+            # PyTorch SDPA (Scaled Dot-Product Attention) optimizations
             torch.backends.cuda.enable_flash_sdp(True)
             torch.backends.cuda.enable_mem_efficient_sdp(True)
             torch.backends.cuda.enable_math_sdp(True)
+            
+            if self.local_rank == 0:
+                self.logger.info("✅ Flash Attention / Memory-Efficient SDPA enabled")
+            
+            # Отключаем детерминизм для скорости
+            torch.use_deterministic_algorithms(False)
+            
+            # Дополнительные оптимизации
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+            
+            if self.local_rank == 0:
+                self.logger.info("✅ All GPU optimizations enabled\n")
 
         self.model = None
         self.threshold = threshold
@@ -182,7 +232,6 @@ class DuplicateRemover:
             self.effective_batch_size = dataloader_batch_size
             self.dataloader_batch_size = dataloader_batch_size // self.world_size
         elif self.use_dp:
-            # DataParallel автоматически распределяет батч
             self.effective_batch_size = dataloader_batch_size
             self.dataloader_batch_size = dataloader_batch_size
         else:
@@ -219,6 +268,11 @@ class DuplicateRemover:
             else:
                 self.logger.info(f"   Mode: Single GPU/CPU")
                 self.logger.info(f"   Batch size: {self.dataloader_batch_size}")
+            
+            if self.autocast_dtype:
+                dtype_name = "BF16" if self.autocast_dtype == torch.bfloat16 else "FP16"
+                self.logger.info(f"   Mixed Precision: {dtype_name}")
+            
             self.logger.info(f"{'='*70}\n")
 
     def _initialize_model(self):
@@ -260,8 +314,7 @@ class DuplicateRemover:
             model = model.to(self.device)
             
             # ================================================================
-            # torch.compile ТОЛЬКО для single GPU или DDP
-            # DataParallel несовместим с torch.compile!
+            # torch.compile ТОЛЬКО для single GPU или DDP (не DataParallel!)
             # ================================================================
             if not self.use_dp:
                 if self.local_rank == 0:
@@ -286,10 +339,15 @@ class DuplicateRemover:
                 if self.local_rank == 0:
                     self.logger.info(f"✅ DataParallel enabled on {self.world_size} GPUs")
             
-            # Warmup
+            # Warmup с autocast
             with torch.no_grad():
                 test_input = torch.randn(1, 3, 448, 448).to(self.device)
-                _ = model(test_input)
+                
+                if self.autocast_dtype:
+                    with torch.autocast(device_type='cuda', dtype=self.autocast_dtype):
+                        _ = model(test_input)
+                else:
+                    _ = model(test_input)
             
             if self.local_rank == 0:
                 self.logger.info("✅ Model verification successful")
@@ -300,7 +358,7 @@ class DuplicateRemover:
         return model
     
     def compute_embeddings(self, dataset: ImageDataset) -> np.ndarray:
-        """Вычисление эмбеддингов"""
+        """Вычисление эмбеддингов с autocast"""
         if self.use_ddp:
             sampler = DistributedSampler(dataset, shuffle=False)
         else:
@@ -318,6 +376,7 @@ class DuplicateRemover:
         )
 
         embeddings = []
+        
         with torch.no_grad():
             for _, images in tqdm(
                 dataloader, 
@@ -326,7 +385,16 @@ class DuplicateRemover:
                 disable=self.use_ddp and self.local_rank != 0
             ):
                 images = images.to(self.device, non_blocking=True)
-                features = self.model(images)
+                
+                # ============================================================
+                # AUTOCAST для BF16/FP16
+                # ============================================================
+                if self.autocast_dtype:
+                    with torch.autocast(device_type='cuda', dtype=self.autocast_dtype):
+                        features = self.model(images)
+                else:
+                    features = self.model(images)
+                
                 embeddings.append(features.cpu().numpy())
 
         local_embeddings = np.vstack(embeddings)
@@ -420,7 +488,6 @@ class DuplicateRemover:
                     self.logger.info("   Moving FAISS index to GPU...")
                 
                 res = faiss.StandardGpuResources()
-                # Увеличиваем временную память для больших индексов
                 res.setTempMemory(2 * 1024 * 1024 * 1024)  # 2GB
                 
                 index = faiss.index_cpu_to_gpu(res, 0, index)
@@ -655,7 +722,8 @@ class DuplicateRemover:
             
             removal_time = time.time() - removal_start
             self.logger.info(f"✅ Removed {removed_count:,} files in {removal_time:.2f}s")
-            self.logger.info(f"   Throughput: {removed_count/removal_time:,.0f} files/sec")
+            if removal_time > 0:
+                self.logger.info(f"   Throughput: {removed_count/removal_time:,.0f} files/sec")
         else:
             self.logger.info("✅ No duplicates found")
         
