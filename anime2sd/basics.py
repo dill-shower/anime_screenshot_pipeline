@@ -4,9 +4,9 @@ import csv
 import json
 import random
 import string
-
+import pillow_jxl
 from PIL import Image
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 
 
@@ -21,7 +21,7 @@ def parse_anime_info(filename: str) -> tuple:
         tuple: A tuple containing the anime name and episode number.
     """
     # Remove square bracket contents
-    filename = re.sub(r"\[.*?\]", "", filename)
+    filename = re.sub(r"```math.*?```", "", filename)
     filename = os.path.splitext(filename)[0].strip()
 
     # Split on the last occurrence of '-'
@@ -140,32 +140,61 @@ def remove_empty_folders(path_abs):
             os.rmdir(path)
 
 
-def get_images_recursively(folder_path):
+def get_images_recursively(folder_path: str, extensions: Optional[List[str]] = None) -> List[str]:
     """
-    Get all images recursively from a folder using Path and rglob.
-
+    Get all images recursively from a folder.
+    More efficient implementation using single rglob and suffix check.
+    
+    Supports: PNG, JPG, JPEG, WEBP, GIF, TIFF, TIF, BMP
+    
     Args:
-    - folder_path (str): The path to the folder.
+        folder_path (str): The path to the folder.
+        extensions (list, optional): Custom list of extensions to search for (without dots).
+                                    If None, uses default list.
 
     Returns:
-    - list: A list of image paths.
+        list: A sorted list of image paths.
     """
-    allowed_patterns = [
-        "*.[Pp][Nn][Gg]",
-        "*.[Jj][Pp][Gg]",
-        "*.[Jj][Pp][Ee][Gg]",
-        "*.[Ww][Ee][Bb][Pp]",
-        "*.[Gg][Ii][Ff]",
-        "*.[Bb][Mm][Pp]",
-    ]
-
-    image_path_list = [
-        str(path)
-        for pattern in allowed_patterns
-        for path in Path(folder_path).rglob(pattern)
-    ]
-
-    return image_path_list
+    if extensions is None:
+        # Default image extensions (lowercase, with dots)
+        IMAGE_EXTENSIONS = {
+            '.png',
+            '.jpg', '.jpeg', '.jpe',
+            '.webp',
+            '.gif',
+            '.tiff', '.tif',  # ✅ TIFF support added
+            '.bmp', '.dib',   # BMP support
+            '.jxl',
+        }
+    else:
+        # Convert provided extensions to lowercase with dots
+        IMAGE_EXTENSIONS = {
+            f'.{ext.lower().lstrip(".")}' for ext in extensions
+        }
+    
+    image_path_list = []
+    folder = Path(folder_path)
+    
+    # Check if folder exists
+    if not folder.exists():
+        return []
+    
+    if not folder.is_dir():
+        return []
+    
+    # Single rglob pass - much faster than multiple pattern-based rglobs
+    try:
+        for path in folder.rglob('*'):
+            if path.is_file():
+                # Case-insensitive extension check
+                if path.suffix.lower() in IMAGE_EXTENSIONS:
+                    image_path_list.append(str(path))
+    except (PermissionError, OSError) as e:
+        # Handle permission errors gracefully
+        import logging
+        logging.warning(f"Could not access some files in {folder_path}: {e}")
+    
+    return sorted(image_path_list)
 
 
 def get_files_recursively(folder_path):
@@ -178,7 +207,14 @@ def get_files_recursively(folder_path):
     Returns:
     - list: A list of file paths.
     """
-    return [str(file) for file in Path(folder_path).rglob("*") if file.is_file()]
+    folder = Path(folder_path)
+    if not folder.exists() or not folder.is_dir():
+        return []
+    
+    try:
+        return sorted([str(file) for file in folder.rglob("*") if file.is_file()])
+    except (PermissionError, OSError):
+        return []
 
 
 def get_folders_recursively(folder_path):
@@ -191,7 +227,14 @@ def get_folders_recursively(folder_path):
     Returns:
     - list: A list of folder paths.
     """
-    return [str(folder) for folder in Path(folder_path).rglob("*") if folder.is_dir()]
+    folder = Path(folder_path)
+    if not folder.exists() or not folder.is_dir():
+        return []
+    
+    try:
+        return sorted([str(subfolder) for subfolder in folder.rglob("*") if subfolder.is_dir()])
+    except (PermissionError, OSError):
+        return []
 
 
 def read_class_mapping(class_mapping_csv):
@@ -206,7 +249,7 @@ def read_class_mapping(class_mapping_csv):
         dict: A dictionary mapping old class names to new class names.
     """
     class_mapping = {}
-    with open(class_mapping_csv, "r") as f:
+    with open(class_mapping_csv, "r", encoding='utf-8') as f:
         reader = csv.reader(f)
         for row in reader:
             if len(row) == 1:
@@ -219,6 +262,15 @@ def read_class_mapping(class_mapping_csv):
 
 
 def get_corr_meta_names(img_path):
+    """
+    Get corresponding metadata filename and path for an image.
+    
+    Args:
+        img_path (str): Path to the image file.
+    
+    Returns:
+        tuple: (meta_path, meta_filename)
+    """
     filename = os.path.basename(img_path)
     base_filename = os.path.splitext(filename)[0]
     meta_filename = f".{base_filename}_meta.json"
@@ -243,11 +295,35 @@ def get_default_group_id(img_path):
 
 
 def get_default_image_size(img_path):
-    with Image.open(img_path) as img:
-        return img.size
+    """
+    Get image dimensions safely.
+    
+    Args:
+        img_path (str): Path to the image file.
+    
+    Returns:
+        tuple: (width, height) or (0, 0) if error
+    """
+    try:
+        with Image.open(img_path) as img:
+            return img.size
+    except Exception as e:
+        import logging
+        logging.warning(f"Could not get size for {img_path}: {e}")
+        return (0, 0)
 
 
 def get_default_metadata(img_path, warn=False):
+    """
+    Generate default metadata for an image.
+    
+    Args:
+        img_path (str): Path to the image file.
+        warn (bool): Whether to print warning message.
+    
+    Returns:
+        dict: Default metadata dictionary.
+    """
     img_path = os.path.abspath(img_path)
     # If metadata doesn't exist,
     # warn the user and generate default metadata
@@ -267,43 +343,75 @@ def get_default_metadata(img_path, warn=False):
 
 
 def get_or_generate_metadata(img_path, warn=False, overwrite_path=False):
+    """
+    Get existing metadata or generate new one if it doesn't exist.
+    
+    Args:
+        img_path (str): Path to the image file.
+        warn (bool): Whether to print warning if metadata doesn't exist.
+        overwrite_path (bool): Whether to overwrite the path field.
+    
+    Returns:
+        dict: Metadata dictionary.
+    """
     img_path = os.path.abspath(img_path)
     meta_path, _ = get_corr_meta_names(img_path)
     updated = False
 
     # If metadata exists, load it
     if os.path.exists(meta_path):
-        with open(meta_path, "r") as meta_file:
-            meta_data = json.load(meta_file)
+        try:
+            with open(meta_path, "r", encoding='utf-8') as meta_file:
+                meta_data = json.load(meta_file)
 
-        # Check for missing fields and update them
-        if "path" not in meta_data or (
-            overwrite_path and meta_data["path"] != img_path
-        ):
-            meta_data["path"] = img_path
-            updated = True
-        if "current_path" not in meta_data or meta_data["current_path"] != img_path:
-            meta_data["current_path"] = img_path
-            updated = True
-        if "filename" not in meta_data:
-            meta_data["filename"] = get_default_filename(img_path)
-            updated = True
-        if "group_id" not in meta_data:
-            meta_data["group_id"] = get_default_group_id(img_path)
-            updated = True
-        if "image_size" not in meta_data:
-            meta_data["image_size"] = get_default_image_size(img_path)
+            # Check for missing fields and update them
+            if "path" not in meta_data or (
+                overwrite_path and meta_data["path"] != img_path
+            ):
+                meta_data["path"] = img_path
+                updated = True
+            if "current_path" not in meta_data or meta_data["current_path"] != img_path:
+                meta_data["current_path"] = img_path
+                updated = True
+            if "filename" not in meta_data:
+                meta_data["filename"] = get_default_filename(img_path)
+                updated = True
+            if "group_id" not in meta_data:
+                meta_data["group_id"] = get_default_group_id(img_path)
+                updated = True
+            if "image_size" not in meta_data:
+                meta_data["image_size"] = get_default_image_size(img_path)
+                updated = True
+        except (json.JSONDecodeError, IOError) as e:
+            import logging
+            logging.warning(f"Could not read metadata for {img_path}: {e}")
+            meta_data = get_default_metadata(img_path, warn)
             updated = True
     else:
         meta_data = get_default_metadata(img_path, warn)
         updated = True
+        
     if updated:
-        with open(meta_path, "w") as meta_file:
-            json.dump(meta_data, meta_file, indent=4)
+        try:
+            with open(meta_path, "w", encoding='utf-8') as meta_file:
+                json.dump(meta_data, meta_file, indent=4)
+        except IOError as e:
+            import logging
+            logging.warning(f"Could not write metadata for {img_path}: {e}")
+            
     return meta_data
 
 
 def get_corr_ccip_names(img_path):
+    """
+    Get corresponding CCIP filename and path for an image.
+    
+    Args:
+        img_path (str): Path to the image file.
+    
+    Returns:
+        tuple: (ccip_path, ccip_filename)
+    """
     filename = os.path.basename(img_path)
     base_filename = os.path.splitext(filename)[0]
     ccip_filename = f".{base_filename}_ccip.npy"
@@ -313,6 +421,15 @@ def get_corr_ccip_names(img_path):
 
 # TODO: Replace the use of this with construct_aux_files_dict
 def get_related_paths(img_path):
+    """
+    Get all related auxiliary files for an image.
+    
+    Args:
+        img_path (str): Path to the image file.
+    
+    Returns:
+        list: List of related file paths.
+    """
     meta_path, _ = get_corr_meta_names(img_path)
     ccip_path, _ = get_corr_ccip_names(img_path)
     res = [meta_path, ccip_path]
