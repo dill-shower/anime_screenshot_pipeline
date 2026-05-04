@@ -35,7 +35,7 @@ aesthetic-predictor-v2-5
 onnxruntime-gpu
 
 # For waifuc installation (как у тебя было)
-wheel>=0.42.0
+wheel>=0.47.0
 
 # --- Optional / keep only if реально используешь где-то в pipeline ---
 scikit-learn>=1.3.2
